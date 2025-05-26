@@ -29,28 +29,34 @@ passengers = {}
 boarding_queue = []
 passenger_counter = 0
 
-# Add default flights
+# Update the available_flights list first
 available_flights = [
     {
-        "flight_number": "FL101",
+        "flight_number": "FL01",
         "departure": "New York",
         "destination": "London",
         "departure_time": "10:00",
-        "status": "On Time"
+        "status": "On Time",
+        "gate": "A1",
+        "aircraft": "Boeing 777-300ER"
     },
     {
-        "flight_number": "FL102",
+        "flight_number": "FL02",
         "departure": "London",
         "destination": "Paris",
         "departure_time": "14:30",
-        "status": "On Time"
+        "status": "On Time",
+        "gate": "B3",
+        "aircraft": "Airbus A320neo"
     },
     {
-        "flight_number": "FL103",
+        "flight_number": "FL03",
         "departure": "Paris",
         "destination": "Dubai",
         "departure_time": "18:45",
-        "status": "On Time"
+        "status": "On Time",
+        "gate": "C2",
+        "aircraft": "Boeing 787-9"
     }
 ]
 
@@ -67,32 +73,109 @@ def serve_static(path):
         return send_from_directory('static', path)
     return send_from_directory('../frontend/build', path)
 
-@app.route('/check-in', methods=["POST"])
+@app.route('/api/check-in', methods=['POST', 'OPTIONS'])
 def check_in():
-    global passenger_counter
-    data = request.json
-    passenger_counter += 1
-    passengers[passenger_counter] = {
-        "name": data["name"],
-        "flight_number": data["flight_number"],
-        "seat": data["seat"],
-        "contact": data["contact"],
-        "boarding_time": data["boarding_time"],
-        "boarding_group": data.get("boarding_group", "C"),  # Default group
-        "checked_bags": data.get("checked_bags", 0),
-        "boarding_status": "pending"
-    }
-    logger.info(f"New passenger checked in: {passengers[passenger_counter]}")
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+        
+    try:
+        data = request.get_json()
+        logger.info(f"Received check-in data: {data}")
+        
+        if not data:
+            logger.error("No JSON data received in request")
+            return jsonify({
+                "error": "No data provided",
+                "available_flights": [
+                    {
+                        "value": f["flight_number"],
+                        "label": f"{f['flight_number']} - {f['departure']} to {f['destination']}"
+                    } for f in available_flights
+                ]
+            }), 400
 
-    # Emit a boarding queue update to all clients
-    queue_for_emit = [(group, time.strftime("%H:%M"), passenger_id) 
-                      for group, time, passenger_id in boarding_queue]
-    socketio.emit('boarding_update', {
-        'queue': queue_for_emit, 
-        'passengers': passengers
-    })
+        # Map numeric flight numbers to FL format
+        flight_number = data.get("flightNumber")
+        if flight_number in ['0', '1', '2', '3']:
+            mapped_flight_number = f"FL0{int(flight_number) + 1}"
+            data["flightNumber"] = mapped_flight_number
+            logger.info(f"Mapped flight number {flight_number} to {mapped_flight_number}")
 
-    return jsonify({"success": True, "passenger_id": passenger_counter})
+        # Validate all required fields
+        required_fields = {
+            "name": str,
+            "age": str,
+            "contact": str,
+            "seatPreference": str,
+            "flightNumber": str
+        }
+
+        for field, field_type in required_fields.items():
+            if field not in data or not isinstance(data[field], field_type):
+                return jsonify({
+                    "error": f"Invalid or missing {field}",
+                    "available_flights": [
+                        {
+                            "value": f["flight_number"],
+                            "label": f"{f['flight_number']} - {f['departure']} to {f['destination']}"
+                        } for f in available_flights
+                    ]
+                }), 400
+
+        # Validate against available flights
+        valid_flight_numbers = [f["flight_number"] for f in available_flights]
+        if data["flightNumber"] not in valid_flight_numbers:
+            return jsonify({
+                "error": "Invalid flight number",
+                "message": f"Please select from available flights: {', '.join(valid_flight_numbers)}",
+                "available_flights": [
+                    {
+                        "value": f["flight_number"],
+                        "label": f"{f['flight_number']} - {f['departure']} to {f['destination']}"
+                    } for f in available_flights
+                ]
+            }), 400
+
+        # Find flight info
+        flight_info = next((f for f in available_flights if f["flight_number"] == data["flightNumber"]), None)
+        if not flight_info:
+            return jsonify({"error": "Flight not found"}), 404
+
+        # Create passenger record with boarding pass number
+        global passenger_counter
+        passenger_counter += 1
+        boarding_pass = f"BP{flight_info['flight_number']}-{passenger_counter:04d}"
+        
+        passengers[passenger_counter] = {
+            "passenger_id": passenger_counter,
+            "boarding_pass": boarding_pass,
+            "name": data["name"],
+            "flight_number": data["flightNumber"],
+            "seat": data["seatPreference"],
+            "contact": data["contact"],
+            "boarding_time": datetime.now().strftime("%H:%M"),
+            "boarding_group": "C",
+            "checked_bags": 0,
+            "boarding_status": "pending",
+            "gate": flight_info["gate"],
+            "aircraft": flight_info["aircraft"],
+            "age": data["age"]
+        }
+        
+        logger.info(f"New passenger checked in: {passengers[passenger_counter]}")
+        
+        # Return detailed response with passenger and flight information
+        return jsonify({
+            "success": True,
+            "passenger_id": passenger_counter,
+            "boarding_pass": boarding_pass,
+            "passenger_details": passengers[passenger_counter],
+            "flight_details": flight_info
+        })
+
+    except Exception as e:
+        logger.error(f"Check-in error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/flight/<int:passenger_id>')
 def flight_details(passenger_id):
@@ -179,15 +262,84 @@ def manifest():
 def get_flights():
     # Return both available flights and flights with checked-in passengers
     booked_flights = set(passenger.get("flight_number") for passenger in passengers.values())
-    all_flights = [
-        flight for flight in available_flights
-        if flight["flight_number"] not in booked_flights
-    ] + [
-        {"flight_number": flight_num, "status": "Boarding"} 
-        for flight_num in booked_flights
-    ]
     
-    return jsonify({"flights": all_flights})
+    # Format all flights with complete details
+    all_flights = []
+    
+    # Add available (unbooked) flights
+    for flight in available_flights:
+        flight_data = {
+            "id": flight["flight_number"],  # For internal use
+            "flight_number": flight["flight_number"],  # Display value (FL01, FL02, etc.)
+            "departure": flight["departure"],
+            "destination": flight["destination"],
+            "departure_time": flight["departure_time"],
+            "status": flight["status"],
+            "gate": flight["gate"],
+            "aircraft": flight["aircraft"],
+            "value": flight["flight_number"],  # For select/dropdown value
+            "label": f"{flight['flight_number']} - {flight['departure']} to {flight['destination']}"  # For select/dropdown display
+        }
+        
+        if flight["flight_number"] not in booked_flights:
+            all_flights.append(flight_data)
+    
+    # Add booked flights with full details
+    for flight_num in booked_flights:
+        flight_info = next((f for f in available_flights if f["flight_number"] == flight_num), None)
+        if flight_info:
+            all_flights.append({
+                "id": flight_info["flight_number"],
+                "flight_number": flight_info["flight_number"],
+                "departure": flight_info["departure"],
+                "destination": flight_info["destination"],
+                "departure_time": flight_info["departure_time"],
+                "status": "Boarding",
+                "gate": flight_info["gate"],
+                "aircraft": flight_info["aircraft"],
+                "value": flight_info["flight_number"],
+                "label": f"{flight_info['flight_number']} - {flight_info['departure']} to {flight_info['destination']}"
+            })
+    
+    return jsonify({
+        "flights": all_flights,
+        "available_flight_numbers": [
+            {
+                "value": f["flight_number"],
+                "label": f"{f['flight_number']} - {f['departure']} to {f['destination']}"
+            } for f in available_flights
+        ]
+    })
+
+# Add a new endpoint for boarding pass
+@app.route('/api/boarding-pass/<int:passenger_id>')
+def get_boarding_pass(passenger_id):
+    if passenger_id not in passengers:
+        return jsonify({"error": "Passenger not found"}), 404
+        
+    passenger = passengers[passenger_id]
+    flight_info = next((f for f in available_flights 
+                       if f["flight_number"] == passenger["flight_number"]), None)
+    
+    if not flight_info:
+        return jsonify({"error": "Flight not found"}), 404
+        
+    return jsonify({
+        "passenger": passenger,
+        "flight": flight_info,
+        "boarding_pass": passenger.get("boarding_pass"),
+        "gate": passenger.get("gate"),
+        "boarding_time": passenger.get("boarding_time"),
+        "boarding_group": passenger.get("boarding_group")
+    })
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    try:
+        print("Starting Flight Management Server...")
+        socketio.run(app, 
+                    host='0.0.0.0',
+                    port=5000,
+                    debug=True,
+                    allow_unsafe_werkzeug=True)
+    except Exception as e:
+        print(f"Error starting server: {e}")
